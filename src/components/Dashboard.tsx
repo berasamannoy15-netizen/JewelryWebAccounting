@@ -1,9 +1,19 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { DropZone } from "@/components/DropZone";
-import { LedgerTable } from "@/components/LedgerTable";
-import type { ExportResponse, LedgerEntry, ScanResponse } from "@/lib/types";
+import { AccountsDirectory } from "@/components/AccountsDirectory";
+import { AccountLedgerView } from "@/components/AccountLedgerView";
+import { TransactionModal } from "@/components/TransactionModal";
+import { BlockDateModal } from "@/components/BlockDateModal";
+import {
+  calculateEntry,
+  INITIAL_SAMPLE_ACCOUNTS,
+  INITIAL_SAMPLE_TRANSACTIONS,
+  type Account,
+  type LedgerEntry,
+  type ScanResponse,
+} from "@/lib/types";
+import { buildAccountLedgerWorkbook, workbookToBuffer } from "@/lib/spreadsheet";
 
 function downloadBase64File(fileName: string, base64: string) {
   const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
@@ -19,23 +29,61 @@ function downloadBase64File(fileName: string, base64: string) {
 }
 
 export function Dashboard() {
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [transactions, setTransactions] = useState<LedgerEntry[]>([]);
+  const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
+  const [blockDate, setBlockDate] = useState<string | null>("02-08-2026");
+
   const [busy, setBusy] = useState(false);
-  const [exporting, setExporting] = useState(false);
-  const [summary, setSummary] = useState("");
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
-  const [driveLink, setDriveLink] = useState("");
-  const [entries, setEntries] = useState<LedgerEntry[]>([]);
+
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
+  const [showScan, setShowScan] = useState(false);
+  const [showAddTxModal, setShowAddTxModal] = useState(false);
+  const [showBlockDateModal, setShowBlockDateModal] = useState(false);
+  const [editingTx, setEditingTx] = useState<LedgerEntry | null>(null);
+
+  // Load state from localStorage on mount
   useEffect(() => {
-    const savedKey = localStorage.getItem("gemini_api_key");
-    if (savedKey) {
-      setApiKey(savedKey);
+    try {
+      const savedAccounts = localStorage.getItem("jewelry_accounts");
+      if (savedAccounts) {
+        setAccounts(JSON.parse(savedAccounts));
+      } else {
+        setAccounts(INITIAL_SAMPLE_ACCOUNTS);
+      }
+
+      const savedTxs = localStorage.getItem("jewelry_transactions");
+      if (savedTxs) {
+        setTransactions(JSON.parse(savedTxs));
+      } else {
+        setTransactions(INITIAL_SAMPLE_TRANSACTIONS);
+      }
+
+      const savedKey = localStorage.getItem("gemini_api_key");
+      if (savedKey) setApiKey(savedKey);
+    } catch {
+      setAccounts(INITIAL_SAMPLE_ACCOUNTS);
+      setTransactions(INITIAL_SAMPLE_TRANSACTIONS);
     }
   }, []);
+
+  // Sync state to localStorage
+  useEffect(() => {
+    if (accounts.length > 0) {
+      localStorage.setItem("jewelry_accounts", JSON.stringify(accounts));
+    }
+  }, [accounts]);
+
+  useEffect(() => {
+    if (transactions.length > 0) {
+      localStorage.setItem("jewelry_transactions", JSON.stringify(transactions));
+    }
+  }, [transactions]);
 
   function handleApiKeyChange(newKey: string) {
     setApiKey(newKey);
@@ -46,7 +94,10 @@ export function Dashboard() {
     }
   }
 
-  const rowCount = entries.length;
+  const activeAccount = useMemo(() => {
+    return accounts.find((a) => a.id === activeAccountId) || null;
+  }, [accounts, activeAccountId]);
+
   const today = useMemo(
     () =>
       new Date().toLocaleDateString("en-IN", {
@@ -58,12 +109,48 @@ export function Dashboard() {
     [],
   );
 
-  async function scanImages(files: File[]) {
-    if (files.length === 0) return;
+  function handleCreateAccount(data: Omit<Account, "id" | "createdAt">) {
+    const newAcc: Account = {
+      ...data,
+      id: `acc-${Date.now()}`,
+      createdAt: new Date().toISOString(),
+    };
+    setAccounts((prev) => [...prev, newAcc]);
+    setActiveAccountId(newAcc.id);
+  }
+
+  function handleDeleteAccount(id: string) {
+    setAccounts((prev) => prev.filter((a) => a.id !== id));
+    setTransactions((prev) => prev.filter((t) => t.accountId !== id));
+    if (activeAccountId === id) setActiveAccountId(null);
+  }
+
+  function handleSaveTransaction(entryData: Partial<LedgerEntry>) {
+    if (!activeAccountId) return;
+
+    if (entryData.id) {
+      // Edit existing transaction
+      setTransactions((prev) =>
+        prev.map((t, idx) => (t.id === entryData.id ? calculateEntry(entryData, activeAccountId, idx) : t)),
+      );
+    } else {
+      // Add new transaction
+      const newTx = calculateEntry(entryData, activeAccountId, transactions.length);
+      setTransactions((prev) => [...prev, newTx]);
+    }
+    setEditingTx(null);
+  }
+
+  function handleDeleteTransaction(id: string) {
+    setTransactions((prev) => prev.filter((t) => t.id !== id));
+    setEditingTx(null);
+  }
+
+  async function scanImagesForActiveAccount(files: File[]) {
+    if (!activeAccountId || files.length === 0) return;
     setError("");
-    setDriveLink("");
     setBusy(true);
-    setStatus(`Sending ${files.length} ledger photo${files.length > 1 ? "s" : ""} to Gemini AI...`);
+    setStatus(`Scanning ${files.length} ledger photo${files.length > 1 ? "s" : ""} into ${activeAccount?.name}...`);
 
     try {
       const formData = new FormData();
@@ -86,20 +173,22 @@ export function Dashboard() {
         throw new Error(payload.error || "Scan failed.");
       }
 
-      const newEntries = payload.entries ?? [];
-      // Stack new entries onto existing entries
-      setEntries((prev) => [...prev, ...newEntries]);
-      setSummary(payload.summary ?? "");
+      const extracted = payload.entries ?? [];
+      const newEntries = extracted.map((item, idx) =>
+        calculateEntry(item, activeAccountId, transactions.length + idx),
+      );
+
+      // Stack newly scanned entries onto active account
+      setTransactions((prev) => [...prev, ...newEntries]);
       setStatus(
         newEntries.length
-          ? `Extracted ${newEntries.length} transaction ${newEntries.length === 1 ? "row" : "rows"} from ${files.length} page${files.length > 1 ? "s" : ""}. Staked onto table below.`
+          ? `Extracted ${newEntries.length} transaction${newEntries.length === 1 ? "" : "s"} into ${activeAccount?.name}. Added to Jama & Issue ledger!`
           : "Scan finished, but no rows were found. Try a clearer photo.",
       );
-    } catch (scanError) {
+      setShowScan(false);
+    } catch (scanErr) {
       setError(
-        scanError instanceof Error
-          ? scanError.message
-          : "Could not read photo(s).",
+        scanErr instanceof Error ? scanErr.message : "Could not scan photos.",
       );
       setStatus("");
     } finally {
@@ -107,41 +196,22 @@ export function Dashboard() {
     }
   }
 
-  async function exportSpreadsheet() {
-    setError("");
-    setExporting(true);
-    setStatus("Building multi-tab Financial Year Excel workbook and syncing...");
+  function exportActiveAccountExcel() {
+    if (!activeAccount) return;
     try {
-      const response = await fetch("/api/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ entries }),
-      });
-      const payload = (await response.json()) as ExportResponse & {
-        error?: string;
-        fileBase64?: string;
-      };
-      if (!response.ok) {
-        throw new Error(payload.error || "Export failed.");
-      }
-      if (payload.fileBase64) {
-        downloadBase64File(payload.fileName, payload.fileBase64);
-      }
-      setDriveLink(payload.drive.webViewLink ?? "");
-      setStatus(payload.drive.message);
-    } catch (exportError) {
-      setError(
-        exportError instanceof Error
-          ? exportError.message
-          : "Could not export the spreadsheet.",
-      );
-    } finally {
-      setExporting(false);
+      const accountTxs = transactions.filter((t) => t.accountId === activeAccount.id);
+      const workbook = buildAccountLedgerWorkbook(activeAccount, accountTxs);
+      const buffer = workbookToBuffer(workbook);
+      const base64 = buffer.toString("base64");
+      downloadBase64File(`${activeAccount.code}_Ledger_${new Date().toISOString().slice(0, 10)}.xlsx`, base64);
+    } catch (expErr) {
+      setError("Failed to export Excel file.");
     }
   }
 
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-7xl flex-col gap-8 px-4 py-8 sm:px-8 sm:py-10">
+      {/* Header */}
       <header className="flex flex-col gap-6 border-b border-gold/20 pb-8 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <p className="text-xs font-medium uppercase tracking-[0.35em] text-gold">
@@ -151,7 +221,7 @@ export function Dashboard() {
             Ledger Atelier
           </h1>
           <p className="mt-3 max-w-2xl text-sm leading-6 text-stone-400 sm:text-base">
-            Photograph handwritten khata pages. Organise multi-page scans, stack Jama & Issue transactions, compute fine weights (`Gross × Melting %`), and export Financial Year Excel workbooks.
+            Manage customer & artisan accounts. View 2-column split Jama & Issue ledgers, snap photo transactions, apply Block Dates, and export Financial Year Excel reports.
           </p>
         </div>
         <div className="flex flex-col gap-3 sm:min-w-[280px]">
@@ -164,9 +234,9 @@ export function Dashboard() {
             </div>
             <div className="rounded-2xl border border-gold/20 bg-panel px-4 py-3">
               <p className="text-[11px] uppercase tracking-widest text-stone-500">
-                Total Rows
+                Accounts
               </p>
-              <p className="mt-1 font-serif text-2xl text-gold">{rowCount}</p>
+              <p className="mt-1 font-serif text-2xl text-gold">{accounts.length}</p>
             </div>
           </div>
           <button
@@ -183,6 +253,7 @@ export function Dashboard() {
         </div>
       </header>
 
+      {/* Gemini API Key Panel */}
       {showSettings && (
         <div className="rounded-2xl border border-gold/30 bg-panel p-5 text-sm">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -226,8 +297,7 @@ export function Dashboard() {
         </div>
       )}
 
-      <DropZone busy={busy} onImagesReady={scanImages} />
-
+      {/* Status & Error Notification Bar */}
       {(status || error) && (
         <div
           className={`rounded-2xl border px-5 py-4 text-sm ${
@@ -237,40 +307,74 @@ export function Dashboard() {
           }`}
         >
           {error || status}
-          {summary && !error ? (
-            <p className="mt-2 text-stone-400">{summary}</p>
-          ) : null}
-          {driveLink ? (
-            <a
-              href={driveLink}
-              target="_blank"
-              rel="noreferrer"
-              className="mt-2 inline-block text-gold underline"
-            >
-              Open in Google Drive
-            </a>
-          ) : null}
         </div>
       )}
 
-      <LedgerTable entries={entries} onChange={setEntries} onClear={() => setEntries([])} />
+      {/* MAIN VIEW CONTROLLER */}
+      {!activeAccount ? (
+        /* View 1: Master Cash Book Account Directory */
+        <AccountsDirectory
+          accounts={accounts}
+          transactions={transactions}
+          onSelectAccount={(acc) => setActiveAccountId(acc.id)}
+          onScanForAccount={(acc) => {
+            setActiveAccountId(acc.id);
+            setShowScan(true);
+          }}
+          onCreateAccount={handleCreateAccount}
+          onDeleteAccount={handleDeleteAccount}
+        />
+      ) : (
+        /* View 2: Split 2-Column Jama vs Issue Ledger View */
+        <AccountLedgerView
+          account={activeAccount}
+          transactions={transactions}
+          blockDate={blockDate}
+          showScan={showScan}
+          busy={busy}
+          onBack={() => {
+            setActiveAccountId(null);
+            setShowScan(false);
+          }}
+          onToggleScan={() => setShowScan(!showScan)}
+          onScanImages={scanImagesForActiveAccount}
+          onOpenAddTransaction={() => {
+            setEditingTx(null);
+            setShowAddTxModal(true);
+          }}
+          onEditTransaction={(tx) => {
+            setEditingTx(tx);
+            setShowAddTxModal(true);
+          }}
+          onOpenBlockDate={() => setShowBlockDateModal(true)}
+          onExportExcel={exportActiveAccountExcel}
+        />
+      )}
 
-      <div className="flex flex-col gap-3 rounded-3xl border border-gold/20 bg-panel/80 p-5 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="font-serif text-xl text-stone-100">Financial Year Excel Export & Cloud Sync</p>
-          <p className="text-sm text-stone-400">
-            Generates a formatted multi-sheet .xlsx workbook (separate tabs for each Financial Year + Combined Ledger) with Jama & Issue fine weight totals.
-          </p>
-        </div>
-        <button
-          type="button"
-          disabled={exporting || entries.length === 0}
-          onClick={exportSpreadsheet}
-          className="rounded-full bg-gold px-6 py-3 text-sm font-semibold text-ink transition hover:bg-gold-soft disabled:cursor-not-allowed disabled:opacity-40"
-        >
-          {exporting ? "Exporting Excel..." : "Export Excel & Sync"}
-        </button>
-      </div>
+      {/* Transaction Modal (Add or Edit) */}
+      {showAddTxModal && activeAccountId && (
+        <TransactionModal
+          isOpen={showAddTxModal}
+          initialData={editingTx}
+          accountId={activeAccountId}
+          onSave={handleSaveTransaction}
+          onDelete={handleDeleteTransaction}
+          onClose={() => {
+            setShowAddTxModal(false);
+            setEditingTx(null);
+          }}
+        />
+      )}
+
+      {/* Block Date Modal */}
+      {showBlockDateModal && (
+        <BlockDateModal
+          isOpen={showBlockDateModal}
+          currentBlockDate={blockDate}
+          onSetBlockDate={(date) => setBlockDate(date)}
+          onClose={() => setShowBlockDateModal(false)}
+        />
+      )}
     </div>
   );
 }
