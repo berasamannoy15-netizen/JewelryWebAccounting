@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { useSession, signOut } from "next-auth/react";
 import { AccountsDirectory } from "@/components/AccountsDirectory";
 import { AccountLedgerView } from "@/components/AccountLedgerView";
 import { TransactionModal } from "@/components/TransactionModal";
@@ -29,6 +30,9 @@ function downloadBase64File(fileName: string, base64: string) {
 }
 
 export function Dashboard() {
+  const { data: session } = useSession();
+  const user = session?.user;
+
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [transactions, setTransactions] = useState<LedgerEntry[]>([]);
   const [activeAccountId, setActiveAccountId] = useState<string | null>(null);
@@ -250,6 +254,39 @@ export function Dashboard() {
             </span>
             <span>{showSettings ? "▲ Hide" : "▼ Change Key"}</span>
           </button>
+
+          {/* Google User Info + Sign Out */}
+          {user && (
+            <div className="flex items-center justify-between rounded-xl border border-gold/20 bg-panel/50 px-4 py-2.5">
+              <div className="flex items-center gap-2.5">
+                {user.image ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={user.image}
+                    alt={user.name ?? "User"}
+                    width={28}
+                    height={28}
+                    className="rounded-full ring-1 ring-gold/30"
+                  />
+                ) : (
+                  <div className="flex h-7 w-7 items-center justify-center rounded-full bg-gold/20 text-xs font-bold text-gold">
+                    {user.name?.[0] ?? "U"}
+                  </div>
+                )}
+                <div className="leading-tight">
+                  <p className="text-[11px] font-medium text-stone-200">{user.name}</p>
+                  <p className="text-[10px] text-stone-500">{user.email}</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => signOut({ callbackUrl: "/login" })}
+                className="text-[10px] uppercase tracking-wider text-stone-500 transition hover:text-red-400"
+              >
+                Sign out
+              </button>
+            </div>
+          )}
         </div>
       </header>
 

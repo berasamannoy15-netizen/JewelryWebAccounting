@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Cormorant_Garamond, Outfit } from "next/font/google";
 import "./globals.css";
+import { SessionProvider } from "@/components/SessionProvider";
 
 const outfit = Outfit({
   variable: "--font-outfit",
@@ -16,7 +17,7 @@ const cormorant = Cormorant_Garamond({
 export const metadata: Metadata = {
   title: "Ledger Atelier | Gold Showroom Accounting",
   description:
-    "Photograph handwritten jewelry ledgers, extract goldsmith entries with gpt-4o Vision, and sync Excel sheets to Google Drive.",
+    "Photograph handwritten jewelry ledgers, extract goldsmith entries with Gemini Vision, and sync Excel sheets to Google Drive.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
@@ -25,7 +26,9 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       lang="en"
       className={`${outfit.variable} ${cormorant.variable} h-full antialiased`}
     >
-      <body className="min-h-full bg-ink text-stone-100">{children}</body>
+      <body className="min-h-full bg-ink text-stone-100">
+        <SessionProvider>{children}</SessionProvider>
+      </body>
     </html>
   );
 }
